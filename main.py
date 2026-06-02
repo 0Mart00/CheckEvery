@@ -3,6 +3,9 @@ import subprocess
 import sys
 import os
 import glob
+import re
+import urllib.request
+import json
 
 # ANSI Color Codes for scannability
 GREEN = "\033[92m"
@@ -24,24 +27,75 @@ def run_command(command):
     except Exception:
         return ""
 
+def get_ip_info(ip):
+    """OSINT Lookup: Fetches geolocation and ISP data for a given IP address."""
+    if ip in ["127.0.0.1", "0.0.0.0", "::1"] or ip.startswith("192.168.") or ip.startswith("10."):
+        return {"country": "Local Network", "city": "Local", "org": "Loopback/LAN", "countryCode": "LOCAL"}
+    try:
+        url = f"http://ip-api.com{ip}"
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return json.loads(response.read().decode())
+    except Exception:
+        return None
+
+def get_current_country():
+    """Helper to detect your baseline location for anomaly checking."""
+    try:
+        with urllib.request.urlopen("http://ip-api.com", timeout=5) as response:
+            data = json.loads(response.read().decode())
+            return data.get("countryCode", "HU")
+    except Exception:
+        return "HU"  # Default fallback assumption
+
 # Enforce ROOT privileges
 if os.getuid() != 0:
     print(f"{RED}{BOLD}[!] ERROR: This script must be run with ROOT privileges (sudo)!{RESET}")
     sys.exit(1)
 
 print(f"{GREEN}{BOLD}============================================================")
-print("===     ARCH LINUX MAXIMUM SECURITY & COMPROMISE CHECK   ===")
+print("===     ARCH LINUX MAXIMUM SECURITY & OSINT CHECK        ===")
 print(f"============================================================{RESET}")
 
-# 1. SYSTEM LOGS (SUCCESSFUL / FAILED LOGINS)
-section_header("1. SYSTEM LOGS (SUCCESSFUL / FAILED LOGINS)")
-print(f"{BOLD}Last successful logins (last):{RESET}")
-print(run_command("last -n 10") or "No login data available.")
+my_country = get_current_country()
+print(f"{BLUE}[i] Baseline country code set to: {my_country}{RESET}")
 
-print(f"\n{RED}{BOLD}Failed login attempts (lastb - SUSPICIOUS!):{RESET}")
-lastb_res = run_command("lastb -n 15")
+# 1. SYSTEM LOGS & OSINT GEOLOCATION ANOMALIES
+section_header("1. SYSTEM LOGS & OSINT IP ANOMALY DETECTION")
+print(f"{BOLD}Analyzing last successful logins and hunting for anomalies...{RESET}")
+
+last_output = run_command("last -i -n 10")
+if last_output:
+    print(f"\n{BOLD}Recent Logins & OSINT Location Analysis:{RESET}")
+    # Extract IPv4 patterns from the command output
+    ips = list(set(re.findall(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', last_output)))
+    for ip in ips:
+        info = get_ip_info(ip)
+        if info and info.get("status") == "success":
+            country = info.get("country", "Unknown")
+            cc = info.get("countryCode", "UNKNOWN")
+            city = info.get("city", "Unknown")
+            isp = info.get("org", "Unknown")
+            
+            # Anomaly trigger if login comes from an unexpected country
+            if cc != "LOCAL" and cc != my_country:
+                print(f"  - IP: {RED}{ip}{RESET} -> {RED}{BOLD}[ANOMALY DETECTED]{RESET} Location: {RED}{city}, {country}{RESET} | ISP: {YELLOW}{isp}{RESET} (Unlikely login origin!)")
+            else:
+                print(f"  - IP: {GREEN}{ip}{RESET} -> Location: {GREEN}{city}, {country}{RESET} | ISP: {isp}")
+        else:
+            print(f"  - IP: {ip} -> Location data unavailable or Local LAN.")
+else:
+    print("No login data available.")
+
+print(f"\n{RED}{BOLD}Failed login attempts (lastb - Targets for OSINT Tracing):{RESET}")
+lastb_res = run_command("lastb -i -n 10")
 if lastb_res:
     print(f"{RED}{lastb_res}{RESET}")
+    failed_ips = list(set(re.findall(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', lastb_res)))
+    print(f"\n{YELLOW}[*] Geolocation of attackers trying to brute-force you:{RESET}")
+    for f_ip in failed_ips:
+        f_info = get_ip_info(f_ip)
+        if f_info and f_info.get("status") == "success":
+            print(f"  - Attacker IP: {RED}{f_ip}{RESET} -> {YELLOW}{f_info.get('city')}, {f_info.get('country')}{RESET} [ISP: {f_info.get('org')}]")
 else:
     print(f"{GREEN}[OK] No failed login attempts found (lastb is clean).{RESET}")
 
@@ -53,7 +107,6 @@ if suspicious_procs:
 else:
     print(f"{GREEN}[OK] No suspicious active processes found by name.{RESET}")
 
-# Deleted binaries still running in memory (Common malware trick)
 deleted_procs = run_command("ls -la /proc/*/exe 2>/dev/null | grep 'deleted'")
 if deleted_procs:
     print(f"{RED}[DANGER] Processes running from DELETED executable files:\n{deleted_procs}{RESET}")
@@ -82,7 +135,6 @@ else:
 
 # 5. PERSISTENCE & PRIVILEGES (BACKDOORS)
 section_header("5. PERSISTENCE & PRIVILEGES (BACKDOORS)")
-# Sudoers integrity
 sudo_check = run_command("sudo visudo -c")
 if "parsed OK" in sudo_check:
     print(f"{GREEN}[OK] The /etc/sudoers file structure is intact.{RESET}")
@@ -92,11 +144,9 @@ else:
 sudoers_dir = run_command("ls -la /etc/sudoers.d/ 2>/dev/null")
 print(f"\n{BOLD}Contents of /etc/sudoers.d/ directory (Only 'README' is default):{RESET}\n{sudoers_dir}")
 
-# Scheduled tasks (Cron)
 print(f"\n{BOLD}System-wide Cron (scheduled) tasks:{RESET}")
 print(run_command("ls -la /etc/cron* /var/spool/cron/* 2>/dev/null") or "No scheduled cron tasks found.")
 
-# User startup files modification
 rc_changes = run_command("find /home/ -maxdepth 2 -name '.*rc' -mtime -2 2>/dev/null")
 if rc_changes:
     print(f"{YELLOW}[WARNING] User configuration files (.bashrc/.zshrc) modified in the last 48 hours:\n{rc_changes}{RESET}")
